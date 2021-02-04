@@ -7,6 +7,27 @@ const ejs = require("ejs");
 const mongoose = require('mongoose');
 const _ = require("lodash");
 const PORT = process.env.PORT || 3000;
+//darkmode
+const Darkmode = require("darkmode-js") ;
+
+
+const options = {
+  bottom: '64px', // default: '32px'
+  right: 'unset', // default: '32px'
+  left: '32px', // default: 'unset'
+  time: '0.5s', // default: '0.3s'
+  mixColor: '#fff', // default: '#fff'
+  backgroundColor: '#fff',  // default: '#fff'
+  buttonColorDark: '#100f2c',  // default: '#100f2c'
+  buttonColorLight: '#fff', // default: '#fff'
+  saveInCookies: false, // default: true,
+  label: '🌗', // default: ''
+  autoMatchOsTheme: true // default: true
+}
+
+const darkmode = new Darkmode(options);
+darkmode.showWidget();
+
 
 //Default Texts-
 const homeStartingContent = "I'm Daily Journal, your best pal. What do I do? Well, I'm here to help you out. I'll be there to listen to your thoughts or share with you my pal's ideas and few amazing blogs.That's all? Not yet. I'm here to take you on a wonderful journey of unlimited thoughts and help you find your twin souls too!!! Sounds great? Here we go....Let's get started.";
@@ -33,24 +54,47 @@ mongoose.connect(URL, {useNewUrlParser: true, useUnifiedTopology: true});
 const blogSchema = {
   blogTitle: String,
   blogContent: String,
+  comments: Array,
+  timestamps: {
+    type: Date, 
+    default: Date.now
+  }
 }
 
 //Making a MongoDB model for the schema-
 const Blog = new mongoose.model("Blog", blogSchema);
 
 //Get request for home route-
-app.get("/", function(req, res){
-  Blog.find({}, function(err, foundBlogs){
-    if(!err){
-      if(foundBlogs){
+app.get(["/", "/page/:page", "/page/:perPage", "/page/:page/:perPage"], function(req, res){
+  var perPage = parseInt(req.params.perPage) || 5;
+  if(req.query.perPage>0)
+    perPage =  parseInt(req.query.perPage);
+  const currentPage = req.params.page || 1;
+  const order = req.query.order || "new one first";
+  Blog
+  .find({})
+  .sort({'timestamps': (order === "new one first")?'desc':'asc'})
+  .skip((perPage * currentPage) - perPage)
+  .limit(perPage)
+  .exec(function(err, foundBlogs) {
+    Blog.count().exec(function(err, count) {
+      if(err)
+        console.log(err);
+      else {
         res.render("home", {
           homeStartingContent: homeStartingContent,
           posts: foundBlogs,
+          current: currentPage,
+          pages: Math.ceil(count/perPage),
+          search: "",
+          perPage: perPage,
+          order: order
         });
       }
-    }
+    })
   });
 });
+
 
 //Get request for about page-
 app.get("/about", function(req, res){
@@ -74,6 +118,7 @@ app.post("/compose", function(req, res){
   const blog = new Blog({
     blogTitle: postTitle,
     blogContent: postContent,
+    comments: []
   })
   console.log(blog);
   blog.save();
@@ -81,17 +126,20 @@ app.post("/compose", function(req, res){
 });
 
 //Get request for posts page-
-app.get("/posts/:postName", function(req, res){
+app.get(["/posts/:postName", "/page/posts/:postName", "/page/:page/posts/:postName", "/search/:query/posts/:postName", "/search/:query/:page/posts/:postName"], function(req, res){
   const requestedTitle = _.lowerCase(req.params.postName);
   Blog.find({}, function(err, posts){
     if(!err){
       posts.forEach(function(post){
         const storedTitle = _.lowerCase(post.blogTitle);
         if(storedTitle === requestedTitle){
+          //Sort the comments to show the recent one
+          post.comments = post.comments.sort((a,b) =>  ((a.timestamps > b.timestamps) ? -1 : ((a.timestamps < b.timestamps) ? 1 : 0)));
           res.render("post", {
             title: post.blogTitle,
             content: post.blogContent,
-            id:post._id
+            id:post._id,
+            comments: post.comments
           });
         }
       });
@@ -101,21 +149,84 @@ app.get("/posts/:postName", function(req, res){
     }
   });
 });
+
+//Post request to create a comment
+app.post("/posts/:postName/comment", async function(req, res) {
+  const {name, content} = req.body;
+  //Server side form validation
+  if(name ==="" || content===""){
+    res.redirect(`/posts/${req.params.postName}`);
+  }
+  else {
+    const doc = await Blog.findOne({blogTitle: req.params.postName});
+    doc.comments.push({'name': name, 
+                       'content': content, 
+                       'timestamps': Math.floor(Date.now() / 1000)});
+                       
+    await Blog.updateOne({blogTitle: req.params.postName}, {comments: doc.comments}, function(err, doc) {
+      if(err)
+        console.log(err);
+    })
+    res.redirect(`/posts/${req.params.postName}`);
+  }
+});
+
 //Post request to search by title
-app.post("/search", function(req, res){
-  const query = req.body.query;
-  Blog.find({blogTitle: { "$regex": query, "$options": "i" }}, function(err, posts){
-    if(!err){
-      res.render('home', {
+app.post(["/search"], function(req, res){
+  const query = req.body.query || req.params.query;
+  var perPage = 5;
+  const currentPage = req.params.page || 1;
+
+  Blog.find({blogTitle: { "$regex": query, "$options": "i" }})
+  .skip((perPage * currentPage) - perPage)
+  .sort({'timestamps': 'desc'})
+  .limit(perPage)
+  .exec( function(err, posts) {
+    Blog.countDocuments({blogTitle: { "$regex": query, "$options": "i" }}, function(err, count) {
+      res.render("home", {
         homeStartingContent: homeStartingContent,
-        posts: posts
-      })
-    }
+        posts: posts,
+        current: currentPage,
+        pages: Math.ceil(count/perPage),
+        search: query,
+        perPage: perPage,
+        order: 'new one first'
+      });
+    })
+    
+  })
+})
+
+// GET request for search to support pagination
+app.get(["/search/:query/:page", "/search/:query", "/search/:query/:page/:perPage", "/search/:query"], function(req, res){
+  const query = req.params.query;
+  var perPage = parseInt(req.params.perPage) || 5;
+  if(req.query.perPage>0)
+    perPage =  parseInt(req.query.perPage);
+  const order = req.query.order || "new one first";
+  const currentPage = req.params.page || 1;
+
+  Blog.find({blogTitle: { "$regex": query, "$options": "i" }})
+  .sort({'timestamps': (order === "new one first")?'desc':'asc'})
+  .skip((perPage * currentPage) - perPage)
+  .limit(perPage)
+  .exec( function(err, posts) {
+    Blog.countDocuments({blogTitle: { "$regex": query, "$options": "i" }}, function(err, count) {
+      res.render("home", {
+        homeStartingContent: homeStartingContent,
+        posts: posts,
+        current: currentPage,
+        pages: Math.ceil(count/perPage),
+        search: query,
+        perPage: perPage,
+        order: order
+      });
+    })
+    
   })
 })
 
 //delete post route
-
 app.post('/posts/:postName', (req, res, next) => {
   const requestedTitle = req.params.postName;
   console.log(requestedTitle)
